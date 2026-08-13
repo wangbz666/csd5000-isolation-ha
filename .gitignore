@@ -1,0 +1,13 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+
+# secrets
+.env
+*.pem
+id_rsa*
+
+# deprecated local copies
+csd5000_isolation_setup.sh
