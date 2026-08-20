@@ -83,6 +83,38 @@ lookup(){
   DISK_SEC=$(( DISK_CAP / 512 ))
 }
 
+# 写操作前检查：namespace 块设备不得挂载或被进程占用
+check_ctrl_idle(){
+  local host="$1" ctrl="$2" label="$3"
+  local busy
+  busy="$(ssh ${SSH_OPTS} "${SSH_USER}@${host}" python3 - "$ctrl" <<'PY'
+import glob, os, subprocess, sys
+ctrl = sys.argv[1]
+busy = []
+for nd in sorted(glob.glob(ctrl + "n*")):
+    if not os.path.exists(nd):
+        continue
+    mp = subprocess.getoutput("findmnt -n -o TARGET %s 2>/dev/null" % nd).strip()
+    if mp:
+        busy.append("%s 已挂载于 %s" % (nd, mp))
+        continue
+    if subprocess.call("fuser -s %s" % nd, shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+        busy.append("%s 正被进程占用 (fuser %s)" % (nd, nd))
+if busy:
+    print("\n".join(busy))
+PY
+)"
+  [[ -z "$busy" ]] || die "${label} (${host}) 块设备仍在使用，请先 umount / 停业务后再执行:\\n${busy}"
+}
+
+check_sn_idle(){
+  local sn="$1"
+  lookup "$sn"
+  check_ctrl_idle "$PORT0" "$P0_CTRL" "Port0"
+  check_ctrl_idle "$PORT1" "$P1_CTRL" "Port1"
+}
+
 do_action(){
   local host="$1" act="$2" ctrl="$3" cid="$4" nsid="$5" sec="$6"
   ssh ${SSH_OPTS} "${SSH_USER}@${host}" python3 - "$act" "$ctrl" "$cid" "$nsid" "$sec" "$DRY_RUN" <<'PY'
@@ -92,8 +124,29 @@ flbaf=0
 def run(c):
     print("+",c)
     if dry!="1": subprocess.check_call(c,shell=True)
+def ns_in_use(nd):
+    mp=subprocess.getoutput("findmnt -n -o TARGET %s 2>/dev/null" % nd).strip()
+    if mp:
+        return "已挂载于 %s" % mp
+    if subprocess.call("fuser -s %s" % nd, shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+        return "正被进程占用"
+    return ""
+def delete_ns(nd):
+    why=ns_in_use(nd)
+    if why:
+        sys.stderr.write("ERROR: %s %s，拒绝 delete-ns\\n" % (nd, why))
+        sys.exit(2)
+    cmd="nvme delete-ns "+nd
+    print("+",cmd)
+    if dry=="1":
+        return
+    rc=subprocess.call(cmd, shell=True)
+    if rc!=0:
+        sys.stderr.write("ERROR: delete-ns %s 失败 (exit %d)。若已挂载请先 umount\\n" % (nd, rc))
+        sys.exit(rc)
 for nd in glob.glob(ctrl+"n*"):
-    if os.path.exists(nd): run("nvme delete-ns "+nd)
+    if os.path.exists(nd): delete_ns(nd)
 if act=="noop": sys.exit(0)
 if act in ("p0","own0"):
     run("nvme create-ns -s %d -c %d -f %d %s" % (sec,sec,flbaf,ctrl))
@@ -111,7 +164,12 @@ print("OK")
 PY
 }
 
-wipe_both(){ local sn="$1"; lookup "$sn"; do_action "$PORT0" noop "$P0_CTRL" "$P0_CID" 1 0; do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0; }
+wipe_both(){
+  local sn="$1"
+  check_sn_idle "$sn"
+  do_action "$PORT0" noop "$P0_CTRL" "$P0_CID" 1 0
+  do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0
+}
 
 split_one(){
   local sn="$1" h0 h1
@@ -134,6 +192,8 @@ split_all(){
   local sns=() sn p0 p1; p0="$(scan_host "$PORT0")"; p1="$(scan_host "$PORT1")"
   declare -A H; while IFS='|' read -r s _; do H[$s]=1; done <<< "$p1"
   while IFS='|' read -r s _; do [[ -n "${H[$s]+x}" ]] && sns+=("$s"); done <<< "$p0"
+  log "预检 ${#sns[@]} 块盘（挂载/占用）..."
+  for sn in "${sns[@]}"; do check_sn_idle "$sn"; done
   log "将全部 ${#sns[@]} 块盘设为对半独享"
   for sn in "${sns[@]}"; do split_one "$sn"; verify_one "$sn"; done
 }
