@@ -121,9 +121,24 @@ do_action(){
 import glob,subprocess,sys,os
 act,ctrl,cid,nsid,sec,dry=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4],int(sys.argv[5]),sys.argv[6]
 flbaf=0
-def run(c):
+def run(c, must_ok=True, timeout=30):
     print("+",c)
-    if dry!="1": subprocess.check_call(c,shell=True)
+    if dry=="1":
+        return
+    try:
+        subprocess.run(c, shell=True, check=must_ok, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("ERROR: 命令超时 (%ds): %s\\n" % (timeout, c))
+        if must_ok:
+            sys.exit(124)
+    except subprocess.CalledProcessError as e:
+        if must_ok:
+            raise
+def reset_ctrl(ctrl):
+    print("+ timeout 20 nvme reset "+ctrl+" (失败不中断)")
+    if dry=="1":
+        return
+    subprocess.run("timeout 20 nvme reset "+ctrl, shell=True)
 def ns_in_use(nd):
     mp=subprocess.getoutput("findmnt -n -o TARGET %s 2>/dev/null" % nd).strip()
     if mp:
@@ -137,11 +152,15 @@ def delete_ns(nd):
     if why:
         sys.stderr.write("ERROR: %s %s，拒绝 delete-ns\\n" % (nd, why))
         sys.exit(2)
-    cmd="nvme delete-ns "+nd
+    cmd="timeout 30 nvme delete-ns "+nd
     print("+",cmd)
     if dry=="1":
         return
-    rc=subprocess.call(cmd, shell=True)
+    try:
+        rc=subprocess.run(cmd, shell=True, timeout=35).returncode
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("ERROR: delete-ns %s 超时。请检查对端节点或做 Slot 下电恢复\\n" % nd)
+        sys.exit(124)
     if rc!=0:
         sys.stderr.write("ERROR: delete-ns %s 失败 (exit %d)。若已挂载请先 umount\\n" % (nd, rc))
         sys.exit(rc)
@@ -151,15 +170,15 @@ if act=="noop": sys.exit(0)
 if act in ("p0","own0"):
     run("nvme create-ns -s %d -c %d -f %d %s" % (sec,sec,flbaf,ctrl))
     run("nvme attach-ns -n %s -c %s %s" % (nsid,cid,ctrl))
-    run("nvme reset "+ctrl)
+    reset_ctrl(ctrl)
 elif act=="p1":
     run("nvme create-ns -s %d -c %d -f %d %s" % (sec,sec,flbaf,ctrl))
     run("nvme attach-ns -n 2 -c %s %s" % (cid,ctrl))
-    run("nvme reset "+ctrl)
+    reset_ctrl(ctrl)
 elif act=="own1":
     run("nvme create-ns -s %d -c %d -f %d %s" % (sec,sec,flbaf,ctrl))
     run("nvme attach-ns -n 1 -c %s %s" % (cid,ctrl))
-    run("nvme reset "+ctrl)
+    reset_ctrl(ctrl)
 print("OK")
 PY
 }
@@ -169,6 +188,14 @@ wipe_both(){
   check_sn_idle "$sn"
   do_action "$PORT0" noop "$P0_CTRL" "$P0_CID" 1 0
   do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0
+}
+
+# own-p1 时先清 Port1 再清 Port0，避免双端口 delete 卡死
+wipe_for_own_p1(){
+  local sn="$1"
+  check_sn_idle "$sn"
+  do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0
+  do_action "$PORT0" noop "$P0_CTRL" "$P0_CID" 1 0
 }
 
 split_one(){
@@ -183,7 +210,7 @@ split_one(){
 }
 
 own_p0(){ local sn="$1"; lookup "$sn"; log "${sn}: 整盘仅P0 (${DISK_SEC} sectors)"; wipe_both "$sn"; do_action "$PORT0" own0 "$P0_CTRL" "$P0_CID" 1 "$DISK_SEC"; }
-own_p1(){ local sn="$1"; lookup "$sn"; log "${sn}: 整盘仅P1 (${DISK_SEC} sectors)"; wipe_both "$sn"; do_action "$PORT1" own1 "$P1_CTRL" "$P1_CID" 1 "$DISK_SEC"; }
+own_p1(){ local sn="$1"; lookup "$sn"; log "${sn}: 整盘仅P1 (${DISK_SEC} sectors)"; wipe_for_own_p1 "$sn"; do_action "$PORT1" own1 "$P1_CTRL" "$P1_CID" 1 "$DISK_SEC"; }
 
 verify_one(){ local sn="$1"; log "验收 ${sn}:"; ssh0 "nvme list|grep -F '${sn}'||echo '  P0: 无'"; ssh1 "nvme list|grep -F '${sn}'||echo '  P1: 无'"; }
 
