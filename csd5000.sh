@@ -190,13 +190,110 @@ wipe_both(){
   do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0
 }
 
-# own-p1 时先清 Port1 再清 Port0，避免双端口 delete 卡死
-wipe_for_own_p1(){
-  local sn="$1"
+# 整盘归属迁移：优先 detach+attach（不 delete / 不 reset），避免双端口固件卡死
+move_own(){
+  local sn="$1" dest="$2"   # dest=p0|p1
   check_sn_idle "$sn"
-  do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0
-  do_action "$PORT0" noop "$P0_CTRL" "$P0_CID" 1 0
+  local src_host src_ctrl src_cid dst_host dst_ctrl dst_cid
+  if [[ "$dest" == "p1" ]]; then
+    src_host="$PORT0"; src_ctrl="$P0_CTRL"; src_cid="$P0_CID"
+    dst_host="$PORT1"; dst_ctrl="$P1_CTRL"; dst_cid="$P1_CID"
+    log "${sn}: 整盘迁移到 Port1（detach P0 → attach P1，不 delete/reset）"
+  else
+    src_host="$PORT1"; src_ctrl="$P1_CTRL"; src_cid="$P1_CID"
+    dst_host="$PORT0"; dst_ctrl="$P0_CTRL"; dst_cid="$P0_CID"
+    log "${sn}: 整盘迁移到 Port0（detach P1 → attach P0，不 delete/reset）"
+  fi
+
+  ssh ${SSH_OPTS} "${SSH_USER}@${src_host}" python3 - "$src_ctrl" "$src_cid" "$DRY_RUN" <<'PY'
+import glob, os, subprocess, sys
+ctrl, cid, dry = sys.argv[1], sys.argv[2], sys.argv[3]
+def run(c, timeout=15):
+    print("+", c)
+    if dry == "1":
+        return 0
+    try:
+        return subprocess.run(c, shell=True, timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("ERROR: 超时: %s\n" % c)
+        sys.exit(124)
+# detach all attached ns from this controller
+attached = subprocess.getoutput("nvme list-ns %s 2>/dev/null" % ctrl)
+for line in attached.splitlines():
+    # formats like: [   0]:0x1
+    if "0x" not in line and ":" not in line:
+        continue
+    ns = line.split(":")[-1].strip()
+    if ns.startswith("0x"):
+        ns = str(int(ns, 16))
+    if not ns.isdigit():
+        continue
+    why = subprocess.getoutput("findmnt -n -o TARGET %sn%s 2>/dev/null" % (ctrl, ns)).strip()
+    if why:
+        sys.stderr.write("ERROR: %sn%s 已挂载于 %s\n" % (ctrl, ns, why))
+        sys.exit(2)
+    rc = run("timeout 15 nvme detach-ns -n %s -c %s %s" % (ns, cid, ctrl))
+    if rc != 0:
+        sys.stderr.write("ERROR: detach-ns 失败 exit=%d\n" % rc)
+        sys.exit(rc or 1)
+print("OK detach")
+PY
+
+  ssh ${SSH_OPTS} "${SSH_USER}@${dst_host}" python3 - "$dst_ctrl" "$dst_cid" "$DISK_SEC" "$DRY_RUN" <<'PY'
+import subprocess, sys, os, time
+ctrl, cid, sec, dry = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+def run(c, timeout=15):
+    print("+", c)
+    if dry == "1":
+        return 0
+    try:
+        return subprocess.run(c, shell=True, timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("ERROR: 超时: %s\n" % c)
+        sys.exit(124)
+# prefer attach existing allocated NS
+alloc = subprocess.getoutput("nvme list-ns -a %s 2>/dev/null" % ctrl)
+nsid = None
+for line in alloc.splitlines():
+    if "0x" in line or ":" in line:
+        ns = line.split(":")[-1].strip()
+        if ns.startswith("0x"):
+            nsid = str(int(ns, 16))
+            break
+        if ns.isdigit():
+            nsid = ns
+            break
+if nsid:
+    rc = run("timeout 15 nvme attach-ns -n %s -c %s %s" % (nsid, cid, ctrl))
+    if rc != 0:
+        sys.stderr.write("ERROR: attach-ns 失败 exit=%d\n" % rc)
+        sys.exit(rc or 1)
+else:
+    # no allocated NS: create once (still no reset)
+    rc = run("timeout 20 nvme create-ns -s %d -c %d -f 0 %s" % (sec, sec, ctrl))
+    if rc != 0:
+        sys.exit(rc or 1)
+    rc = run("timeout 15 nvme attach-ns -n 1 -c %s %s" % (cid, ctrl))
+    if rc != 0:
+        sys.exit(rc or 1)
+run("timeout 10 nvme ns-rescan %s" % ctrl, timeout=12)
+time.sleep(1)
+blk = ctrl + "n1"
+if dry != "1" and not os.path.exists(blk):
+    # wait briefly for udev
+    for _ in range(10):
+        time.sleep(0.5)
+        if os.path.exists(blk):
+            break
+if dry != "1" and not os.path.exists(blk):
+    sys.stderr.write("ERROR: attach 后未出现块设备 %s\n" % blk)
+    sys.exit(1)
+print("OK attach", blk if dry != "1" else "(dry-run)")
+PY
 }
+
+own_p0(){ local sn="$1"; lookup "$sn"; move_own "$sn" p0; }
+own_p1(){ local sn="$1"; lookup "$sn"; move_own "$sn" p1; }
 
 split_one(){
   local sn="$1" h0 h1
@@ -208,9 +305,6 @@ split_one(){
   do_action "$PORT0" p0 "$P0_CTRL" "$P0_CID" 1 "$h0"
   do_action "$PORT1" p1 "$P1_CTRL" "$P1_CID" 2 "$h1"
 }
-
-own_p0(){ local sn="$1"; lookup "$sn"; log "${sn}: 整盘仅P0 (${DISK_SEC} sectors)"; wipe_both "$sn"; do_action "$PORT0" own0 "$P0_CTRL" "$P0_CID" 1 "$DISK_SEC"; }
-own_p1(){ local sn="$1"; lookup "$sn"; log "${sn}: 整盘仅P1 (${DISK_SEC} sectors)"; wipe_for_own_p1 "$sn"; do_action "$PORT1" own1 "$P1_CTRL" "$P1_CID" 1 "$DISK_SEC"; }
 
 verify_one(){ local sn="$1"; log "验收 ${sn}:"; ssh0 "nvme list|grep -F '${sn}'||echo '  P0: 无'"; ssh1 "nvme list|grep -F '${sn}'||echo '  P1: 无'"; }
 

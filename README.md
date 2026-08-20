@@ -63,7 +63,8 @@ ssh-copy-id root@192.168.255.98
 
 ## 注意
 
-- `--confirm` 会删除 namespace，**数据不可恢复**
+- `--confirm` 会删除 namespace，**数据不可恢复**（`split-*` 会 delete；`own-p0/own-p1` 优先用 detach+attach，不删 NS）
 - **写操作前必须先 umount** 目标盘；脚本会自动检测挂载/占用，未卸载则拒绝执行
 - 必须配对正确：`--port0 .96 --port1 .98`（同 JBOF 机箱）
+- `own-*` **不要**对已挂载盘操作；双端口盘禁止随意 `nvme reset` / `delete-ns`（易导致控制器卡死需下电）
 - 配置后各节点自行 `mkfs` + `mount`
