@@ -190,7 +190,11 @@ wipe_both(){
   do_action "$PORT1" noop "$P1_CTRL" "$P1_CID" 2 0
 }
 
-# 整盘归属迁移：优先 detach+attach（不 delete / 不 reset），避免双端口固件卡死
+# 整盘归属迁移：两侧先强制 detach，再只 attach 到目标端（不 delete / 不 reset）
+# 修复点：
+# 1) 旧逻辑只按 list-ns 从源端 detach，固件残留 attach 会导致对端 I/O Access Denied(sc=0x15)
+# 2) exists(/dev/nvmeXn1) 会把残留普通文件误判为成功
+# 3) 缺少小块 I/O 探测，mkfs 前才暴露问题
 move_own(){
   local sn="$1" dest="$2"   # dest=p0|p1
   check_sn_idle "$sn"
@@ -198,98 +202,174 @@ move_own(){
   if [[ "$dest" == "p1" ]]; then
     src_host="$PORT0"; src_ctrl="$P0_CTRL"; src_cid="$P0_CID"
     dst_host="$PORT1"; dst_ctrl="$P1_CTRL"; dst_cid="$P1_CID"
-    log "${sn}: 整盘迁移到 Port1（detach P0 → attach P1，不 delete/reset）"
+    log "${sn}: 整盘迁移到 Port1（双侧 detach → 仅 P1 attach）"
   else
     src_host="$PORT1"; src_ctrl="$P1_CTRL"; src_cid="$P1_CID"
     dst_host="$PORT0"; dst_ctrl="$P0_CTRL"; dst_cid="$P0_CID"
-    log "${sn}: 整盘迁移到 Port0（detach P1 → attach P0，不 delete/reset）"
+    log "${sn}: 整盘迁移到 Port0（双侧 detach → 仅 P0 attach）"
   fi
 
-  ssh ${SSH_OPTS} "${SSH_USER}@${src_host}" python3 - "$src_ctrl" "$src_cid" "$DRY_RUN" <<'PY'
-import glob, os, subprocess, sys
+  # Step A: 两侧都对 NS 做 detach（忽略 NOT_ATTACHED），清掉固件残留
+  local h c cid
+  for h in "$src_host" "$dst_host"; do
+    if [[ "$h" == "$PORT0" ]]; then c="$P0_CTRL"; cid="$P0_CID"; else c="$P1_CTRL"; cid="$P1_CID"; fi
+    log "detach on ${h} ctrl=${c} cid=${cid}"
+    ssh ${SSH_OPTS} "${SSH_USER}@${h}" python3 - "$c" "$cid" "$DRY_RUN" <<'PY'
+import os, stat, subprocess, sys
 ctrl, cid, dry = sys.argv[1], sys.argv[2], sys.argv[3]
-def run(c, timeout=15):
-    print("+", c)
-    if dry == "1":
-        return 0
-    try:
-        return subprocess.run(c, shell=True, timeout=timeout).returncode
-    except subprocess.TimeoutExpired:
-        sys.stderr.write("ERROR: 超时: %s\n" % c)
-        sys.exit(124)
-# detach all attached ns from this controller
-attached = subprocess.getoutput("nvme list-ns %s 2>/dev/null" % ctrl)
-for line in attached.splitlines():
-    # formats like: [   0]:0x1
-    if "0x" not in line and ":" not in line:
-        continue
-    ns = line.split(":")[-1].strip()
-    if ns.startswith("0x"):
-        ns = str(int(ns, 16))
-    if not ns.isdigit():
-        continue
-    why = subprocess.getoutput("findmnt -n -o TARGET %sn%s 2>/dev/null" % (ctrl, ns)).strip()
-    if why:
-        sys.stderr.write("ERROR: %sn%s 已挂载于 %s\n" % (ctrl, ns, why))
-        sys.exit(2)
-    rc = run("timeout 15 nvme detach-ns -n %s -c %s %s" % (ns, cid, ctrl))
-    if rc != 0:
-        sys.stderr.write("ERROR: detach-ns 失败 exit=%d\n" % rc)
-        sys.exit(rc or 1)
-print("OK detach")
-PY
 
-  ssh ${SSH_OPTS} "${SSH_USER}@${dst_host}" python3 - "$dst_ctrl" "$dst_cid" "$DISK_SEC" "$DRY_RUN" <<'PY'
-import subprocess, sys, os, time
-ctrl, cid, sec, dry = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-def run(c, timeout=15):
-    print("+", c)
+def run_cap(cmd, timeout=15):
+    print("+", cmd)
     if dry == "1":
-        return 0
+        return 0, ""
     try:
-        return subprocess.run(c, shell=True, timeout=timeout).returncode
+        p = subprocess.run(cmd, shell=True, timeout=timeout,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True)
+        out = p.stdout or ""
+        if out.strip():
+            print(out.rstrip())
+        return p.returncode, out
     except subprocess.TimeoutExpired:
-        sys.stderr.write("ERROR: 超时: %s\n" % c)
+        sys.stderr.write("ERROR: 超时: %s\n" % cmd)
         sys.exit(124)
-# prefer attach existing allocated NS
-alloc = subprocess.getoutput("nvme list-ns -a %s 2>/dev/null" % ctrl)
-nsid = None
-for line in alloc.splitlines():
-    if "0x" in line or ":" in line:
+
+def parse_nsids(text):
+    ids = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
         ns = line.split(":")[-1].strip()
         if ns.startswith("0x"):
-            nsid = str(int(ns, 16))
-            break
-        if ns.isdigit():
-            nsid = ns
-            break
+            ns = str(int(ns, 16))
+        if ns.isdigit() and ns not in ids:
+            ids.append(ns)
+    return ids
+
+for nd in (ctrl + "n1", ctrl + "n2"):
+    if os.path.exists(nd) and not stat.S_ISBLK(os.stat(nd).st_mode):
+        print("+ rm stale non-block", nd)
+        if dry != "1":
+            os.remove(nd)
+
+nsids = set(parse_nsids(subprocess.getoutput("nvme list-ns %s 2>/dev/null" % ctrl)))
+nsids.update(parse_nsids(subprocess.getoutput("nvme list-ns -a %s 2>/dev/null" % ctrl)))
+if not nsids:
+    nsids.add("1")
+
+for ns in sorted(nsids, key=lambda x: int(x)):
+    blk = "%sn%s" % (ctrl, ns)
+    mp = subprocess.getoutput("findmnt -n -o TARGET %s 2>/dev/null" % blk).strip()
+    if mp:
+        sys.stderr.write("ERROR: %s 已挂载于 %s，拒绝 detach\n" % (blk, mp))
+        sys.exit(2)
+    rc, out = run_cap("timeout 15 nvme detach-ns -n %s -c %s %s" % (ns, cid, ctrl))
+    if rc == 0 or "NOT_ATTACHED" in out or "not attached" in out.lower():
+        continue
+    sys.stderr.write("ERROR: detach-ns nsid=%s 失败 exit=%d\n" % (ns, rc))
+    sys.exit(rc or 1)
+
+att = subprocess.getoutput("nvme list-ns %s 2>/dev/null" % ctrl).strip()
+if dry != "1" and att:
+    sys.stderr.write("ERROR: detach 后 %s 仍有 attached NS:\n%s\n" % (ctrl, att))
+    sys.exit(6)
+print("OK detach-side", ctrl)
+PY
+  done
+
+  # Step B: 只 attach 到目标端
+  log "attach on ${dst_host} ctrl=${dst_ctrl} cid=${dst_cid}"
+  ssh ${SSH_OPTS} "${SSH_USER}@${dst_host}" python3 - "$dst_ctrl" "$dst_cid" "$DISK_SEC" "$DRY_RUN" <<'PY'
+import os, stat, subprocess, sys, time
+ctrl, cid, sec, dry = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+def run_cap(cmd, timeout=15):
+    print("+", cmd)
+    if dry == "1":
+        return 0, ""
+    try:
+        p = subprocess.run(cmd, shell=True, timeout=timeout,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True)
+        out = p.stdout or ""
+        if out.strip():
+            print(out.rstrip())
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("ERROR: 超时: %s\n" % cmd)
+        sys.exit(124)
+
+def parse_nsids(text):
+    ids = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        ns = line.split(":")[-1].strip()
+        if ns.startswith("0x"):
+            ns = str(int(ns, 16))
+        if ns.isdigit() and ns not in ids:
+            ids.append(ns)
+    return ids
+
+def is_blk(path):
+    return os.path.exists(path) and stat.S_ISBLK(os.stat(path).st_mode)
+
+for nd in (ctrl + "n1", ctrl + "n2"):
+    if os.path.exists(nd) and not is_blk(nd):
+        print("+ rm stale non-block", nd)
+        if dry != "1":
+            os.remove(nd)
+
+alloc = parse_nsids(subprocess.getoutput("nvme list-ns -a %s 2>/dev/null" % ctrl))
+nsid = alloc[0] if alloc else None
 if nsid:
-    rc = run("timeout 15 nvme attach-ns -n %s -c %s %s" % (nsid, cid, ctrl))
-    if rc != 0:
-        sys.stderr.write("ERROR: attach-ns 失败 exit=%d\n" % rc)
+    rc, out = run_cap("timeout 15 nvme attach-ns -n %s -c %s %s" % (nsid, cid, ctrl))
+    if rc != 0 and "ALREADY_ATTACHED" not in out:
+        sys.stderr.write("ERROR: attach-ns 失败\n")
         sys.exit(rc or 1)
 else:
-    # no allocated NS: create once (still no reset)
-    rc = run("timeout 20 nvme create-ns -s %d -c %d -f 0 %s" % (sec, sec, ctrl))
+    rc, _ = run_cap("timeout 20 nvme create-ns -s %d -c %d -f 0 %s" % (sec, sec, ctrl), timeout=25)
     if rc != 0:
         sys.exit(rc or 1)
-    rc = run("timeout 15 nvme attach-ns -n 1 -c %s %s" % (cid, ctrl))
-    if rc != 0:
+    rc, out = run_cap("timeout 15 nvme attach-ns -n 1 -c %s %s" % (cid, ctrl))
+    if rc != 0 and "ALREADY_ATTACHED" not in out:
         sys.exit(rc or 1)
-run("timeout 10 nvme ns-rescan %s" % ctrl, timeout=12)
+
+run_cap("timeout 10 nvme ns-rescan %s" % ctrl, timeout=12)
 time.sleep(1)
 blk = ctrl + "n1"
-if dry != "1" and not os.path.exists(blk):
-    # wait briefly for udev
-    for _ in range(10):
-        time.sleep(0.5)
-        if os.path.exists(blk):
+if dry != "1":
+    for _ in range(20):
+        if is_blk(blk):
             break
-if dry != "1" and not os.path.exists(blk):
-    sys.stderr.write("ERROR: attach 后未出现块设备 %s\n" % blk)
-    sys.exit(1)
+        time.sleep(0.3)
+    if not is_blk(blk):
+        sys.stderr.write("ERROR: attach 后未出现块设备 %s\n" % blk)
+        sys.exit(1)
+    # I/O 探测：对端残留 attach 时常见 sc=0x15 Access Denied
+    rc, out = run_cap("timeout 8 dd if=/dev/zero of=%s bs=4096 count=1 oflag=direct" % blk, timeout=10)
+    if rc != 0:
+        sys.stderr.write("ERROR: 块设备存在但 I/O 失败。常见原因：对端端口仍残留 attach (NVMe Access Denied)。\n")
+        sys.stderr.write("请在对端执行: nvme list-ns <ctrl> 应为空，然后重跑 own-p*。\n")
+        sys.exit(5)
 print("OK attach", blk if dry != "1" else "(dry-run)")
 PY
+
+  # Step C: 源端 attached 必须为空
+  log "验收：源端不应再有 attached NS"
+  ssh ${SSH_OPTS} "${SSH_USER}@${src_host}" python3 - "$src_ctrl" "$DRY_RUN" <<'PY'
+import subprocess, sys
+ctrl, dry = sys.argv[1], sys.argv[2]
+if dry == "1":
+    print("OK source check skipped (dry-run)")
+    sys.exit(0)
+att = subprocess.getoutput("nvme list-ns %s 2>/dev/null" % ctrl).strip()
+if att:
+    sys.stderr.write("ERROR: 源端 %s 仍有 attached NS:\n%s\n" % (ctrl, att))
+    sys.exit(6)
+print("OK source detached", ctrl)
+PY
+  verify_one "$sn"
 }
 
 own_p0(){ local sn="$1"; lookup "$sn"; move_own "$sn" p0; }
